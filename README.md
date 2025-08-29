@@ -11,12 +11,16 @@ This repository provides Python source code and configuration files.
 A public CSV with M2 features for M3 training is also provided.
 
 ## Model development
-`/model`  
+```
+/model
+```
 
 Contains scripts for modules M1, M2, and M3.
 
 ## Analysis
-`/analysis`  
+```
+/analysis
+```  
 
 Scripts for model analysis including Shapley value analysis and uncertainty contours.
 
