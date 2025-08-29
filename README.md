@@ -11,10 +11,12 @@ A public CSV with M2 features for M3 training is also provided.
 
 ## Model development
 `/model`  
+
 Contains scripts for modules M1, M2, and M3.
 
 ## Analysis
 `/analysis`  
+
 Scripts for model analysis including Shapley value analysis and uncertainty contours.
 
 ## Installation
