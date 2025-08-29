@@ -17,6 +17,9 @@ Contains scripts for modules M1, M2, and M3.
 `/analysis`  
 Scripts for model analysis including Shapley value analysis and uncertainty contours.
 
+## Installation
+Python 3.12 or newer is recommended.
+
 ## Citation
 If you use this code or model in your research, please cite our work  
 (citation details to be added upon publication).
