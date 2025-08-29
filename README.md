@@ -1,4 +1,4 @@
-# CIFLE: cycle-informed fatigue-life estimation
+# CIFLE: cycle-informed fatigue-life estimation framework
 
 ## Project overview
 - CIFLE consists of three modules that work in sequence
