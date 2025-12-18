@@ -38,6 +38,7 @@ python analysis/CIFLE.py \
     --bnn_train_data "path/to/calculation_results.csv" \
     --raw_data_dir "path/to/raw_loops_directory" \
     --outdir "results"
+'''
 
 ## Installation
 Python 3.12 or newer is recommended.
