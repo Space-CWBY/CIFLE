@@ -1,604 +1,598 @@
-
+# =========================
+# File: M2.py
+# =========================
+# -*- coding: utf-8 -*-
 """
-M2: Automated extraction of fatigue parameters
+M2: Automated extraction of loop-based fatigue parameters (deployment)
 
-Data expectations
-- Raw loop CSV per test, with columns for strain, cycle, stress
-- Strain may be in percent or fraction. Specify via --strain_units
-- Stress in MPa
+Implements deterministic, rule-based extraction used in CIFLE.
 
-Optional
-- You may provide a trained M1 ANN model to synthesize additional cycles beyond max measured cycle
+Key definitions
+- Upper/lower branches split using max/min stress locations in acquisition order,
+  then each branch is strain-sorted.
+- Twinning yield strength (TYS, σyT):
+  1) take lower branch (strain-sorted)
+  2) split into two equal segments
+  3) fit a straight line on the central 30–70% subrange of each segment
+  4) take intersection (ε*, σ*)
+  5) report σyT as the stress at the discrete loop point closest to ε*
+- Inflection point (εIP, σIP): sign change of smoothed second derivative on upper branch
+- ΔWp: absolute loop area (plastic strain energy density per cycle)
+- ΔWe+: area under tangent line at εIP, integrated from tensile zero-stress crossing
+         to ε at σMT (max tensile stress)
 
-Outputs
-- calculation_results.csv
-- calculation_results_with_scaling.csv  (per-file min-max normalization of selected parameters)
-- Optional PNG plots with annotated features
+Units
+- Stress: MPa
+- Strain input: percent or fraction
+- Energies returned for compatibility: kJ/m3 (Wp, We)
 
+CLI supports batch-processing raw CSVs (project-compatible defaults).
 """
+
+from __future__ import annotations
 
 import argparse
 import os
-from datetime import datetime
 import re
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+
 import numpy as np
 import pandas as pd
 from scipy.signal import savgol_filter
-from scipy.optimize import curve_fit
-from scipy.integrate import simpson
-import matplotlib.pyplot as plt
 
-# Optional Keras for M1-based synthesis
-try:
-    from tensorflow import keras
-except Exception:
-    keras = None
+Number = Union[int, float, np.number]
+
+
+# -----------------------------
+# Configuration
+# -----------------------------
+@dataclass(frozen=True)
+class M2Config:
+    strain_units: str = "percent"   # "percent" or "fraction"
+    energy_units: str = "kJ/m3"     # internal computation; outputs still kJ/m3
+    smooth_frac: float = 0.15
+    smooth_min_window: int = 11
+    smooth_polyorder: int = 3
+    tys_trim_lo: float = 0.30
+    tys_trim_hi: float = 0.70
+    grad_trim_lo: float = 0.30
+    grad_trim_hi: float = 0.70
 
 
 # -----------------------------
 # Utilities
 # -----------------------------
-def set_seed(seed: int = 42):
-    np.random.seed(seed)
+def _as_float_array(x: Sequence[Number]) -> np.ndarray:
+    return np.asarray(x, dtype=float)
 
 
-def mkdir(path: str):
-    os.makedirs(path, exist_ok=True)
-
-
-def odd_window(n: int, frac: float = 0.15, minimum: int = 11) -> int:
-    """Pick a Savitzky–Golay window length that is odd and < n."""
-    w = max(minimum, int(frac * n) | 1)  # make odd
-    if w >= n:
-        w = (n - 1) if (n % 2 == 0) else (n - 2)
-    if w < 5:
-        w = 5
+def _odd_window(n: int, frac: float, minimum: int) -> int:
+    if n <= 1:
+        return 1
+    w = int(round(frac * n))
+    w = max(minimum, w)
     if w % 2 == 0:
-        w -= 1
-    return max(5, w)
+        w += 1
+    if w >= n:
+        w = n - 1 if (n - 1) % 2 == 1 else n - 2
+    return max(3, w)
 
 
-def parse_filename_tokens(fname_stem: str):
-    """Extract strain amplitude in percent and frequency in Hz from filename tokens if present."""
-    toks = re.split(r"[ _\-]+", fname_stem)
-    strain = None
-    freq = None
-    for t in toks:
-        t2 = t.replace(",", ".")
-        if "%" in t2:
-            try:
-                strain = float(t2.replace("%", ""))
-            except Exception:
-                pass
-        if re.search(r"hz$", t2, re.IGNORECASE):
-            try:
-                freq = float(re.sub(r"hz$", "", t2, flags=re.IGNORECASE))
-            except Exception:
-                pass
-    return strain, freq
+def _to_fractional_strain(strain: np.ndarray, strain_units: str) -> np.ndarray:
+    u = strain_units.lower()
+    if u in ["percent", "%", "pct"]:
+        return strain / 100.0
+    if u in ["fraction", "frac"]:
+        return strain
+    raise ValueError(f"Unsupported strain_units='{strain_units}'. Use 'percent' or 'fraction'.")
 
 
-def to_fractional_strain(strain_arr: np.ndarray, units: str) -> np.ndarray:
-    if units.lower() in ["percent", "pct", "%"]:
-        return strain_arr / 100.0
-    return strain_arr.astype(float)
+def loop_area_mpa(strain_frac: np.ndarray, stress_mpa: np.ndarray) -> float:
+    x = _as_float_array(strain_frac)
+    y = _as_float_array(stress_mpa)
+    if len(x) < 3:
+        return float("nan")
+    return 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
 
 
-def energy_units_j_per_m3_from_mpa(mpa: np.ndarray, strain: np.ndarray) -> float:
+def energy_from_area(area_mpa: float, units: str = "kJ/m3") -> float:
+    if not np.isfinite(area_mpa):
+        return float("nan")
+    j_per_m3 = abs(area_mpa) * 1e6
+    if units == "J/m3":
+        return float(j_per_m3)
+    if units == "kJ/m3":
+        return float(j_per_m3 / 1000.0)
+    raise ValueError(f"Unsupported energy units '{units}'.")
+
+
+def _cyclic_slice(df: pd.DataFrame, start: int, end: int) -> pd.DataFrame:
+    n = len(df)
+    if n == 0:
+        return df.copy()
+    start = int(start) % n
+    end = int(end) % n
+    if start <= end:
+        return df.iloc[start : end + 1].copy()
+    return pd.concat([df.iloc[start:], df.iloc[: end + 1]], axis=0).copy()
+
+
+def split_upper_lower_branches(loop_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Integrate σ dε with σ in MPa and ε dimensionless to get MPa * strain.
-    1 MPa = 1e6 Pa so multiply by 1e6 to convert to J/m³.
+    loop_df must contain columns ['Strain','Stress'] in acquisition order.
+    Returns (upper, lower) as strain-sorted, duplicate-strain removed DataFrames.
     """
-    return simpson(mpa, strain) * 1e6
+    if loop_df.empty:
+        return loop_df.copy(), loop_df.copy()
 
+    df = loop_df[["Strain", "Stress"]].copy().reset_index(drop=True)
+    if df["Stress"].isna().all():
+        return df.copy(), df.copy()
 
-def polygon_loop_area(strain: np.ndarray, stress_mpa: np.ndarray) -> float:
-    """
-    Approximate loop area by integrating around the closed path once.
-    Assumes points correspond to one contiguous cycle in acquisition order.
-    """
-    s = np.asarray(strain)
-    sig = np.asarray(stress_mpa)
-    # Ensure closed path
-    s_closed = np.concatenate([s, s[:1]])
-    sig_closed = np.concatenate([sig, sig[:1]])
-    # Polygon area in σ–ε plane equals ∮ σ dε
-    return np.trapz(sig_closed, s_closed)
+    idx_min = int(df["Stress"].idxmin())
+    idx_max = int(df["Stress"].idxmax())
 
+    upper_raw = _cyclic_slice(df, idx_min, idx_max)
+    lower_raw = _cyclic_slice(df, idx_max, idx_min)
 
-# -----------------------------
-# Loop segmentation
-# -----------------------------
-def identify_upper_lower_loops(df_cycle: pd.DataFrame):
-    """
-    Split one cycle into UPPER (tension) and LOWER (compression) branches.
-    Method: path from min(σ) to max(σ) defines upper branch when sorted by strain,
-            complement defines lower branch. This is robust to mean stress.
-    """
-    idx_min = df_cycle["Stress"].idxmin()
-    idx_max = df_cycle["Stress"].idxmax()
-
-    if idx_min < idx_max:
-        upper = df_cycle.loc[idx_min:idx_max]
-    else:
-        upper = pd.concat([df_cycle.loc[idx_min:], df_cycle.loc[:idx_max]])
-
-    upper = upper.sort_values("Strain").reset_index(drop=True)
-    lower = df_cycle.drop(upper.index).sort_values("Strain").reset_index(drop=True)
+    upper = upper_raw.sort_values("Strain").drop_duplicates(subset=["Strain"]).reset_index(drop=True)
+    lower = lower_raw.sort_values("Strain").drop_duplicates(subset=["Strain"]).reset_index(drop=True)
     return upper, lower
 
 
-# -----------------------------
-# Paper-consistent features
-# -----------------------------
-def inflection_point_upper(upper: pd.DataFrame):
+def inflection_point_upper(upper: pd.DataFrame, cfg: M2Config) -> Tuple[float, float]:
+    if upper is None or len(upper) < 9:
+        return float("nan"), float("nan")
+
+    s = _as_float_array(upper["Strain"].values)
+    sig = _as_float_array(upper["Stress"].values)
+
+    order = np.argsort(s)
+    s = s[order]
+    sig = sig[order]
+
+    ds = np.diff(s)
+    if not np.all(np.isfinite(ds)) or np.nanmedian(np.abs(ds)) <= 0:
+        return float("nan"), float("nan")
+
+    win = _odd_window(len(s), cfg.smooth_frac, cfg.smooth_min_window)
+    try:
+        d2 = savgol_filter(
+            sig,
+            window_length=win,
+            polyorder=cfg.smooth_polyorder,
+            deriv=2,
+            delta=float(np.median(ds)),
+            mode="interp",
+        )
+    except Exception:
+        return float("nan"), float("nan")
+
+    sign = np.sign(d2)
+    valid = np.isfinite(sign)
+    if not np.any(valid):
+        return float("nan"), float("nan")
+
+    idx_change = None
+    for i in range(1, len(sign)):
+        if not (valid[i - 1] and valid[i]):
+            continue
+        if sign[i - 1] < 0 and sign[i] > 0:
+            idx_change = i
+            break
+
+    if idx_change is None:
+        for i in range(1, len(sign)):
+            if not (valid[i - 1] and valid[i]):
+                continue
+            if sign[i - 1] == 0 or sign[i] == 0:
+                continue
+            if sign[i - 1] != sign[i]:
+                idx_change = i
+                break
+
+    if idx_change is None:
+        return float("nan"), float("nan")
+
+    lo = max(0, idx_change - 2)
+    hi = min(len(s), idx_change + 3)
+    j = lo + int(np.nanargmin(np.abs(d2[lo:hi])))
+
+    return float(s[j]), float(sig[j])
+
+
+def _trim_middle(df: pd.DataFrame, lo: float, hi: float) -> pd.DataFrame:
+    n = len(df)
+    if n < 3:
+        return df.copy()
+    a = int(np.floor(lo * n))
+    b = int(np.ceil(hi * n))
+    a = max(0, min(n - 2, a))
+    b = max(a + 2, min(n, b))
+    return df.iloc[a:b].copy()
+
+
+def twinning_yield_from_lower(lower: pd.DataFrame, cfg: M2Config) -> Dict[str, float]:
     """
-    εIP detection per paper:
-      on UPPER branch, find first index where second derivative changes from negative to positive
+    Returns:
+      - TYS Strain (%) and TYS Stress (MPa): discrete loop point closest to intersection strain
+      - plus diagnostic line/intersection values
     """
-    if len(upper) < 9:
-        return np.nan, np.nan
-
-    s = upper["Strain"].values
-    sig = upper["Stress"].values
-    win = odd_window(len(upper))
-    # Smooth σ(ε)
-    sig_s = savgol_filter(sig, window_length=win, polyorder=3, mode="interp")
-    # First and second derivatives vs strain
-    # Use Savitzky–Golay for derivatives
-    d1 = savgol_filter(sig, window_length=win, polyorder=3, deriv=1, delta=np.median(np.diff(s)), mode="interp")
-    d2 = savgol_filter(sig, window_length=win, polyorder=3, deriv=2, delta=np.median(np.diff(s)), mode="interp")
-
-    # Find first negative->positive crossing in d2
-    for i in range(1, len(d2)):
-        if np.isfinite(d2[i - 1]) and np.isfinite(d2[i]) and d2[i - 1] < 0 <= d2[i]:
-            return s[i], sig_s[i]
-
-    # Fallback: strongest curvature minimum
-    i_min = int(np.nanargmin(d2))
-    return s[i_min], sig_s[i_min]
-
-
-def tangents_and_tys_lower(lower: pd.DataFrame):
-    """
-    σyT detection per paper:
-      Fit two lines to the first and second halves of LOWER branch in strain order,
-      take their intersection for twinning yield.
-    """
-    if len(lower) < 10:
-        return np.nan, np.nan, (np.nan, np.nan), (np.nan, np.nan)
+    out: Dict[str, float] = {
+        "TYS Strain (%)": float("nan"),
+        "TYS Stress (MPa)": float("nan"),
+        "TYS Intersection Strain (%)": float("nan"),
+        "TYS Intersection Stress (MPa)": float("nan"),
+        "TYS Tangent1 Slope (MPa)": float("nan"),
+        "TYS Tangent1 Intercept (MPa)": float("nan"),
+        "TYS Tangent2 Slope (MPa)": float("nan"),
+        "TYS Tangent2 Intercept (MPa)": float("nan"),
+    }
+    if lower is None or len(lower) < 10:
+        return out
 
     lo = lower.sort_values("Strain").reset_index(drop=True)
     mid = len(lo) // 2
-    first = lo.iloc[:mid]
-    second = lo.iloc[mid:]
+    seg1 = lo.iloc[:mid]
+    seg2 = lo.iloc[mid:]
 
-    # Trim 30–70% region in each half to avoid end-effects
-    def middle_trim(df):
-        n = len(df)
-        a = int(0.30 * n)
-        b = int(0.70 * n)
-        if b <= a:
-            a = max(0, n // 4)
-            b = max(a + 2, 3 * n // 4)
-        return df.iloc[a:b]
+    seg1m = _trim_middle(seg1, cfg.tys_trim_lo, cfg.tys_trim_hi)
+    seg2m = _trim_middle(seg2, cfg.tys_trim_lo, cfg.tys_trim_hi)
 
-    f1 = middle_trim(first)
-    f2 = middle_trim(second)
-
-    def linfit(x, y):
-        p, _ = curve_fit(lambda x, a, b: a * x + b, x, y, maxfev=2000)
-        return p  # a, b
+    def fit_line(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+        a, b = np.polyfit(x.astype(float), y.astype(float), deg=1)
+        return float(a), float(b)
 
     try:
-        a1, b1 = linfit(f1["Strain"].values, f1["Stress"].values)
-        a2, b2 = linfit(f2["Strain"].values, f2["Stress"].values)
+        a1, b1 = fit_line(seg1m["Strain"].values, seg1m["Stress"].values)
+        a2, b2 = fit_line(seg2m["Strain"].values, seg2m["Stress"].values)
     except Exception:
-        return np.nan, np.nan, (np.nan, np.nan), (np.nan, np.nan)
+        return out
+
+    out["TYS Tangent1 Slope (MPa)"] = a1
+    out["TYS Tangent1 Intercept (MPa)"] = b1
+    out["TYS Tangent2 Slope (MPa)"] = a2
+    out["TYS Tangent2 Intercept (MPa)"] = b2
 
     if abs(a1 - a2) < 1e-12:
-        return np.nan, np.nan, (a1, b1), (a2, b2)
+        return out
 
     x_int = (b2 - b1) / (a1 - a2)
     y_int = a1 * x_int + b1
-    return x_int, y_int, (a1, b1), (a2, b2)
 
+    out["TYS Intersection Strain (%)"] = float(x_int) * 100.0
+    out["TYS Intersection Stress (MPa)"] = float(y_int)
 
-def twinning_gradient_postyield(lower: pd.DataFrame, tys_strain: float, strain_fractional: bool) -> float:
-    """
-    σ̇_T: slope on LOWER branch beyond σyT.
-    Fit a line on the post-yield window [tys, tys + Δ], where Δ spans middle 30–70% of the remainder.
-    Returns GPa.
-    """
-    if np.isnan(tys_strain):
-        return np.nan
+    strains = _as_float_array(lo["Strain"].values)
+    stresses = _as_float_array(lo["Stress"].values)
+    if len(strains) == 0:
+        return out
 
-    lo = lower.sort_values("Strain").reset_index(drop=True)
-    post = lo[lo["Strain"] >= tys_strain].copy()
-    if len(post) < 6:
-        return np.nan
-
-    n = len(post)
-    a = int(0.30 * n)
-    b = int(0.70 * n)
-    seg = post.iloc[a:b] if b > a else post
-
-    x = seg["Strain"].values
-    y = seg["Stress"].values
-
-    # slope in MPa per unit strain
-    try:
-        a_fit, b_fit = np.polyfit(x, y, 1)
-    except Exception:
-        return np.nan
-
-    # Units:
-    #  if strain is fractional, slope is MPa => convert to GPa by /1000
-    #  if strain is in percent, caller converted to fraction beforehand
-    return a_fit / 1000.0  # GPa
-
-
-def zero_stress_crossing_on_upper(upper: pd.DataFrame):
-    """Find tensile-side zero-stress crossing by linear interpolation."""
-    sig = upper["Stress"].values
-    eps = upper["Strain"].values
-    for i in range(len(sig) - 1):
-        if sig[i] <= 0 < sig[i + 1]:
-            # linear interpolate between i and i+1
-            x1, x2 = eps[i], eps[i + 1]
-            y1, y2 = sig[i], sig[i + 1]
-            if y2 != y1:
-                return x1 - y1 * (x2 - x1) / (y2 - y1)
-    # fallback: smallest |stress| point
-    return eps[np.argmin(np.abs(sig))]
-
-
-def we_plus_tangent(upper: pd.DataFrame, eps_ip: float, sig_ip: float, eps_mt: float, mode: str = "tangent_at_inflection") -> float:
-    """
-    ΔWe+ per paper:
-      area under the TANGENT line to the tension branch.
-      We take the tangent at εIP by default, integrate from tensile zero-crossing to ε at σMT.
-      Units returned in kJ/m^3.
-    """
-    if np.isnan(eps_ip) or np.isnan(sig_ip) or np.isnan(eps_mt):
-        return np.nan
-
-    # Local tangent slope around εIP
-    s = upper["Strain"].values
-    sig = upper["Stress"].values
-    win = odd_window(len(upper))
-    d1 = savgol_filter(sig, window_length=win, polyorder=3, deriv=1, delta=np.median(np.diff(s)), mode="interp")
-
-    # pick index closest to εIP
-    i_ip = int(np.argmin(np.abs(s - eps_ip)))
-    slope_mpa = d1[i_ip]  # MPa per unit strain
-
-    # Intercept through the point (εIP, σIP): σ = a*(ε - εIP) + σIP
-    # Integrate between ε0 (tensile zero) and εMT
-    eps0 = zero_stress_crossing_on_upper(upper)
-    a = slope_mpa
-    b = sig_ip - a * eps_ip  # σ = a ε + b
-
-    # Integral of σ dε = ∫(a ε + b) dε = 0.5 a (ε²) + b ε
-    eps1 = float(eps0)
-    eps2 = float(eps_mt)
-    j_per_m3 = (0.5 * a * (eps2**2 - eps1**2) + b * (eps2 - eps1)) * 1e6  # MPa->Pa
-    return j_per_m3 / 1000.0  # kJ/m^3
-
-
-# -----------------------------
-# Optional M1 synthesis
-# -----------------------------
-def fake_loop_dataset(half_cycle: int, strain_amp_pct: float, material: int, heat: int, half_len: int):
-    cycle = np.full(half_len * 2 - 2, half_cycle)
-    s1 = np.linspace(-strain_amp_pct, strain_amp_pct, half_len)
-    s_m = s1[::-1][1:-1]
-    s = np.concatenate([s1, s_m])
-    s_lag = np.concatenate([[s[-1]], s[:-1]])
-    return pd.DataFrame(
-        {
-            "Cycle": cycle,
-            "Strain": s,
-            "Strain - 1": s_lag,
-            "Strain Amplitude": np.full_like(s, strain_amp_pct),
-            "Material": np.full_like(s, material),
-            "Heat Treatment": np.full_like(s, heat),
-        }
-    )
-
-
-def maybe_load_m1(model_path: str):
-    if not model_path:
-        return None
-    if keras is None:
-        raise RuntimeError("TensorFlow Keras is required to load the M1 model")
-    return keras.models.load_model(model_path)
-
-
-def normalize_with_table(df: pd.DataFrame, mean_std_csv: str) -> pd.DataFrame:
-    ms = pd.read_csv(mean_std_csv, index_col=0)
-    d = ms.to_dict(orient="index")
-    out = df.copy()
-    for col in out.columns:
-        if col in d:
-            out[col] = (out[col] - d[col]["mean"]) / d[col]["std"]
+    k = int(np.nanargmin(np.abs(strains - x_int)))
+    out["TYS Strain (%)"] = float(strains[k]) * 100.0
+    out["TYS Stress (MPa)"] = float(stresses[k])
     return out
 
 
-def inverse_from_table(values: np.ndarray, mean_std_csv: str, target_col: str) -> np.ndarray:
-    ms = pd.read_csv(mean_std_csv, index_col=0)
-    m = ms.loc[target_col, "mean"]
-    s = ms.loc[target_col, "std"]
-    return values * s + m
+def twinning_gradient_postyield(lower: pd.DataFrame, tys_strain_frac: float, cfg: M2Config) -> float:
+    if lower is None or len(lower) < 10 or not np.isfinite(tys_strain_frac):
+        return float("nan")
+
+    lo = lower.sort_values("Strain").reset_index(drop=True)
+    post = lo[lo["Strain"] >= tys_strain_frac].copy()
+    if len(post) < 6:
+        return float("nan")
+
+    seg = _trim_middle(post, cfg.grad_trim_lo, cfg.grad_trim_hi)
+    if len(seg) < 3:
+        seg = post
+
+    x = _as_float_array(seg["Strain"].values)
+    y = _as_float_array(seg["Stress"].values)
+    if len(x) < 2 or np.nanstd(x) == 0:
+        return float("nan")
+
+    a, _ = np.polyfit(x, y, deg=1)  # MPa per strain fraction
+    return float(a) / 1000.0  # GPa
+
+
+def tensile_zero_crossing(upper: pd.DataFrame) -> float:
+    if upper is None or len(upper) < 2:
+        return float("nan")
+
+    s = _as_float_array(upper["Strain"].values)
+    sig = _as_float_array(upper["Stress"].values)
+
+    order = np.argsort(s)
+    s = s[order]
+    sig = sig[order]
+
+    for i in range(1, len(s)):
+        if not (np.isfinite(sig[i - 1]) and np.isfinite(sig[i])):
+            continue
+        if (sig[i - 1] <= 0.0 and sig[i] >= 0.0) or (sig[i - 1] >= 0.0 and sig[i] <= 0.0):
+            if sig[i] == sig[i - 1]:
+                return float(s[i])
+            t = (0.0 - sig[i - 1]) / (sig[i] - sig[i - 1])
+            return float(s[i - 1] + t * (s[i] - s[i - 1]))
+    return float("nan")
+
+
+def we_plus_tangent(
+    upper: pd.DataFrame,
+    eps_ip: float,
+    sig_ip: float,
+    eps_at_sig_mt: float,
+    cfg: M2Config,
+) -> float:
+    """
+    ΔWe+ (kJ/m3): integrate tangent at εIP from ε(σ=0) to ε(σMT).
+    """
+    if upper is None or len(upper) < 9:
+        return float("nan")
+    if not (np.isfinite(eps_ip) and np.isfinite(sig_ip) and np.isfinite(eps_at_sig_mt)):
+        return float("nan")
+
+    s = _as_float_array(upper["Strain"].values)
+    sig = _as_float_array(upper["Stress"].values)
+    order = np.argsort(s)
+    s = s[order]
+    sig = sig[order]
+
+    ds = np.diff(s)
+    if np.nanmedian(np.abs(ds)) <= 0:
+        return float("nan")
+
+    win = _odd_window(len(s), cfg.smooth_frac, cfg.smooth_min_window)
+    try:
+        d1 = savgol_filter(
+            sig,
+            window_length=win,
+            polyorder=cfg.smooth_polyorder,
+            deriv=1,
+            delta=float(np.median(ds)),
+            mode="interp",
+        )
+    except Exception:
+        return float("nan")
+
+    j = int(np.nanargmin(np.abs(s - eps_ip)))
+    a = float(d1[j])
+    b = float(sig_ip) - a * float(eps_ip)  # σ = a ε + b
+
+    eps0 = tensile_zero_crossing(pd.DataFrame({"Strain": s, "Stress": sig}))
+    if not np.isfinite(eps0):
+        return float("nan")
+
+    eps1 = float(eps0)
+    eps2 = float(eps_at_sig_mt)
+    if eps2 <= eps1:
+        return float("nan")
+
+    area_mpa = 0.5 * a * (eps2 ** 2 - eps1 ** 2) + b * (eps2 - eps1)  # MPa
+    area_mpa = max(0.0, float(area_mpa))
+
+    return energy_from_area(area_mpa, units=cfg.energy_units)  # kJ/m3 if cfg.energy_units="kJ/m3"
+
+
+def extract_loop_features(
+    loop_df: pd.DataFrame,
+    cfg: Optional[M2Config] = None,
+    strain_units: Optional[str] = None,
+) -> Dict[str, float]:
+    """
+    Extract M2 parameters from a single hysteresis loop.
+
+    Returns keys compatible with M3:
+      - Wp (kJ/m3)
+      - We (kJ/m3)
+      - Tensile Peak Stress (MPa)
+      - Compressive Peak Stress (MPa)
+      - Inflection Strain (%)
+      - TYS Stress (MPa)
+      - Twinning Gradient (GPa)
+
+    Extra keys also included:
+      - Inflection Stress (MPa)
+      - TYS Strain (%)
+    """
+    if cfg is None:
+        cfg = M2Config()
+    if strain_units is None:
+        strain_units = cfg.strain_units
+
+    if loop_df is None or loop_df.empty:
+        return {
+            "Wp (kJ/m3)": float("nan"),
+            "We (kJ/m3)": float("nan"),
+            "Inflection Strain (%)": float("nan"),
+            "Inflection Stress (MPa)": float("nan"),
+            "TYS Stress (MPa)": float("nan"),
+            "TYS Strain (%)": float("nan"),
+            "Twinning Gradient (GPa)": float("nan"),
+            "Tensile Peak Stress (MPa)": float("nan"),
+            "Compressive Peak Stress (MPa)": float("nan"),
+        }
+
+    df = loop_df.copy()
+    if "Strain" not in df.columns or "Stress" not in df.columns:
+        raise ValueError("loop_df must have columns 'Strain' and 'Stress'.")
+
+    strain_in = _as_float_array(df["Strain"].values)
+    stress_mpa = _as_float_array(df["Stress"].values)
+
+    strain_frac = _to_fractional_strain(strain_in, strain_units=strain_units)
+
+    loop_frac = pd.DataFrame({"Strain": strain_frac, "Stress": stress_mpa})
+    upper, lower = split_upper_lower_branches(loop_frac)
+
+    eps_ip_f, sig_ip = inflection_point_upper(upper, cfg)
+    tys_info = twinning_yield_from_lower(lower, cfg)
+
+    tys_strain_f = float(tys_info["TYS Strain (%)"]) / 100.0 if np.isfinite(tys_info["TYS Strain (%)"]) else float("nan")
+    sigma_dot_gpa = twinning_gradient_postyield(lower, tys_strain_f, cfg)
+
+    sig_mt = float(np.nanmax(stress_mpa)) if np.any(np.isfinite(stress_mpa)) else float("nan")
+    sig_mc = float(np.nanmin(stress_mpa)) if np.any(np.isfinite(stress_mpa)) else float("nan")
+
+    eps_at_sig_mt_f = float("nan")
+    if upper is not None and len(upper) > 0 and np.any(np.isfinite(upper["Stress"].values)):
+        i_mt = int(np.nanargmax(upper["Stress"].values))
+        eps_at_sig_mt_f = float(upper["Strain"].values[i_mt])
+
+    area_mpa = loop_area_mpa(strain_frac, stress_mpa)
+    wp_kj = energy_from_area(area_mpa, units=cfg.energy_units)
+
+    we_kj = we_plus_tangent(upper, eps_ip_f, sig_ip, eps_at_sig_mt_f, cfg)
+
+    # If someone sets cfg.energy_units="J/m3", still output kJ/m3 for compatibility
+    if cfg.energy_units == "J/m3":
+        wp_kj = wp_kj / 1000.0 if np.isfinite(wp_kj) else float("nan")
+        we_kj = we_kj / 1000.0 if np.isfinite(we_kj) else float("nan")
+
+    return {
+        "Wp (kJ/m3)": float(wp_kj),
+        "We (kJ/m3)": float(we_kj),
+        "Inflection Strain (%)": float(eps_ip_f) * 100.0 if np.isfinite(eps_ip_f) else float("nan"),
+        "Inflection Stress (MPa)": float(sig_ip) if np.isfinite(sig_ip) else float("nan"),
+        "TYS Strain (%)": float(tys_info["TYS Strain (%)"]),
+        "TYS Stress (MPa)": float(tys_info["TYS Stress (MPa)"]),
+        "Twinning Gradient (GPa)": float(sigma_dot_gpa),
+        "Tensile Peak Stress (MPa)": float(sig_mt),
+        "Compressive Peak Stress (MPa)": float(sig_mc),
+    }
 
 
 # -----------------------------
-# Plotting
+# CLI (batch)
 # -----------------------------
-def plot_results(df_cycle, upper, lower, inflect, tys, lin1, lin2, cycle, save_path):
-    plt.figure(figsize=(8, 5.5))
-    plt.plot(df_cycle["Strain"], df_cycle["Stress"], color="gray", linewidth=1.2, label="Loop")
-    if len(upper):
-        plt.scatter(upper["Strain"], upper["Stress"], s=10, color="#1f77b4", label="Upper")
-    if len(lower):
-        plt.scatter(lower["Strain"], lower["Stress"], s=10, color="#2ca02c", label="Lower")
-    if not (np.isnan(inflect[0]) or np.isnan(inflect[1])):
-        plt.scatter(inflect[0], inflect[1], color="red", s=30, zorder=5, label="εIP")
-    if not (np.isnan(tys[0]) or np.isnan(tys[1])):
-        plt.scatter(tys[0], tys[1], color="magenta", s=30, zorder=5, label="σyT")
-    # Draw tangent lines
-    xs = np.linspace(df_cycle["Strain"].min(), df_cycle["Strain"].max(), 100)
-    if not any(np.isnan(lin1)):
-        plt.plot(xs, lin1[0] * xs + lin1[1], "--", color="orange", linewidth=1.2, label="Lower tangent 1")
-    if not any(np.isnan(lin2)):
-        plt.plot(xs, lin2[0] * xs + lin2[1], "--", color="purple", linewidth=1.2, label="Lower tangent 2")
-
-    plt.xlabel("Strain (fraction)")
-    plt.ylabel("Stress (MPa)")
-    plt.title(f"Cycle {cycle}")
-    plt.grid(True, ls="--", alpha=0.5)
-    plt.legend(fontsize=9, ncol=2)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=200)
-    plt.close()
+def _parse_cols(cols: str) -> Tuple[int, int, int]:
+    parts = [c.strip() for c in cols.split(",")]
+    if len(parts) != 3:
+        raise ValueError("--cols must be three comma-separated integers like '3,4,5'.")
+    return int(parts[0]), int(parts[1]), int(parts[2])
 
 
-# -----------------------------
-# CLI
-# -----------------------------
-def parse_args():
-    p = argparse.ArgumentParser(description="M2 parameter extraction per paper definitions with log-spaced cycle sampling")
-    # I/O
-    p.add_argument("--raw_root", type=str, required=True, help="Root folder containing subdirectories with raw loop CSVs")
-    p.add_argument("--subdirs", type=str, default="", help="Comma-separated subfolders to include. Default all immediate subfolders")
+def _log_spaced_cycles(min_cycle: int, max_cycle: int, n_points: int) -> List[int]:
+    if max_cycle <= min_cycle:
+        return [max_cycle]
+    grid = np.logspace(np.log10(min_cycle), np.log10(max_cycle), int(n_points))
+    cyc = np.unique(np.clip(np.round(grid).astype(int), min_cycle, max_cycle))
+    return [int(c) for c in cyc.tolist()]
+
+
+def _material_heat_from_folder(folder_name: str) -> Tuple[int, int]:
+    mat = 0 if re.search(r"AZ91", folder_name, re.IGNORECASE) else 1
+    ht = 300 if re.search(r"300", folder_name) else 400
+    return mat, ht
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="M2 loop feature extraction (CIFLE)")
+    p.add_argument("--raw_root", type=str, required=True, help="Root folder containing subdirectories of raw loop CSVs")
+    p.add_argument("--subdirs", type=str, default="", help="Comma-separated subfolder names. Default scans all immediate subfolders")
     p.add_argument("--outdir", type=str, default="outputs", help="Output directory")
 
-    # Raw CSV format
-    p.add_argument("--cols", type=str, default="3,4,5", help="Zero-based column indices for [strain, cycle, stress]")
-    p.add_argument("--header", type=str, default="0", help="Header row index or 'None'")
+    p.add_argument("--cols", type=str, default="3,4,5", help="Zero-based indices for [strain, cycle, stress] columns")
+    p.add_argument("--header", type=str, default="0", help="Header row index, or 'None'")
     p.add_argument("--sep", type=str, default=",", help="CSV delimiter")
-    p.add_argument("--strain_units", type=str, default="percent", choices=["percent", "fraction"], help="Units of strain column in raw CSV")
+    p.add_argument("--strain_units", type=str, default="percent", choices=["percent", "fraction"])
 
-    # Cycle sampling
     p.add_argument("--min_cycle", type=int, default=3)
-    p.add_argument("--log_points", type=int, default=15, help="Number of log-spaced cycles between min and max")
-    p.add_argument("--include_half_life", action="store_true", help="Also include half-life cycle")
+    p.add_argument("--log_points", type=int, default=15)
+    p.add_argument("--failure_offset", type=int, default=0)
 
-    # Optional M1 synthesis
-    p.add_argument("--m1_model", type=str, default="", help="Path to trained M1 ANN model (.keras or .h5)")
-    p.add_argument("--m1_mean_std", type=str, default="", help="Path to mean_std.csv used for M1")
-    p.add_argument("--synth_points", type=int, default=0, help="If >0, synthesize this many extra cycles in logspace above max")
-    p.add_argument("--synth_half_length", type=int, default=25)
-
-    # Plots
-    p.add_argument("--save_plots", action="store_true")
-    p.add_argument("--plot_every", type=int, default=1, help="Save every Nth plot to limit output size")
-
-    # Misc
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
 
-# -----------------------------
-# Main
-# -----------------------------
-def main():
+def main() -> None:
     args = parse_args()
-    set_seed(args.seed)
+    np.random.seed(int(args.seed))
 
-    # prepare output
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_root = os.path.join(args.outdir, f"m2_{stamp}")
-    mkdir(out_root)
+    out_root = os.path.abspath(args.outdir)
+    os.makedirs(out_root, exist_ok=True)
 
-    # subdirs
     if args.subdirs.strip():
-        subfolders = [os.path.join(args.raw_root, s.strip()) for s in args.subdirs.split(",")]
+        subfolders = [os.path.join(args.raw_root, s.strip()) for s in args.subdirs.split(",") if s.strip()]
     else:
-        subfolders = [os.path.join(args.raw_root, d) for d in os.listdir(args.raw_root) if os.path.isdir(os.path.join(args.raw_root, d))]
+        subfolders = [os.path.join(args.raw_root, d) for d in os.listdir(args.raw_root)]
 
-    # optional M1
-    model = None
-    if args.m1_model:
-        model = maybe_load_m1(args.m1_model)
-        if not args.m1_mean_std:
-            raise ValueError("--m1_mean_std is required when --m1_model is provided")
+    col_s, col_c, col_sig = _parse_cols(args.cols)
+    header = None if str(args.header).lower() == "none" else int(args.header)
 
-    # accumulation
-    rows = []
+    cfg = M2Config(strain_units=args.strain_units, energy_units="kJ/m3")
+
+    rows: List[Dict[str, float]] = []
 
     for folder in subfolders:
-        subname = os.path.basename(folder)
         if not os.path.isdir(folder):
             continue
 
-        material = 0 if re.search(r"AZ91", subname, re.IGNORECASE) else 1
-        heat = 300 if re.search(r"300", subname) else 400
+        subname = os.path.basename(folder)
+        material, heat = _material_heat_from_folder(subname)
 
         for fname in os.listdir(folder):
             if not fname.lower().endswith(".csv"):
                 continue
 
-            path = os.path.join(folder, fname)
-            stem = os.path.splitext(fname)[0]
-            strain_amp_pct, freq_hz = parse_filename_tokens(stem)
-
-            # load raw
-            header = None if args.header.lower() == "none" else int(args.header)
+            fpath = os.path.join(folder, fname)
             try:
-                raw = pd.read_csv(path, header=header, sep=args.sep)
+                df = pd.read_csv(fpath, header=header, sep=args.sep)
             except Exception as e:
-                print(f"Skip {path}  reason {e}")
+                print(f"[M2] Skip {fpath}  read error: {e}")
                 continue
 
-            cidx = [int(x) for x in args.cols.split(",")]
-            use = raw.iloc[:, cidx].copy()
-            use.columns = ["Strain_raw", "Cycle", "Stress"]
-            # convert strain to fraction
-            use["Strain"] = to_fractional_strain(use["Strain_raw"].astype(float), args.strain_units)
-            use.drop(columns=["Strain_raw"], inplace=True)
-
-            # Optionally thin for very large recordings
-            # Determine max cycle
-            if use["Cycle"].empty:
-                continue
-            max_cycle = int(np.nanmax(use["Cycle"].values))
-            if max_cycle < args.min_cycle + 5:
-                # too small sequence
+            try:
+                df = df.iloc[:, [col_s, col_c, col_sig]].copy()
+                df.columns = ["Strain", "Cycle", "Stress"]
+            except Exception as e:
+                print(f"[M2] Skip {fpath}  column error: {e}")
                 continue
 
-            # Log-spaced cycles
-            life_cycles = np.unique(np.logspace(np.log10(args.min_cycle), np.log10(max_cycle), args.log_points).astype(int))
-            if args.include_half_life:
-                life_cycles = np.unique(np.append(life_cycles, max_cycle // 2))
+            df = df.dropna(subset=["Strain", "Cycle", "Stress"]).reset_index(drop=True)
+            if df.empty:
+                continue
 
-            # Optional synthesis beyond max
-            synth_cycles = []
-            if model is not None and args.synth_points > 0:
-                ext = np.unique(np.logspace(np.log10(max_cycle), np.log10(3 * max_cycle), args.synth_points + 1).astype(int))[1:]
-                synth_cycles = ext.tolist()
+            max_cycle = int(np.nanmax(df["Cycle"].values))
+            nf = max(1, max_cycle - int(args.failure_offset))
 
-            # process measured cycles
-            all_cycles = list(life_cycles) + synth_cycles
-            for idx_c, cyc in enumerate(all_cycles, 1):
-                if cyc <= max_cycle:
-                    cyc_df = use[use["Cycle"] == cyc].copy()
-                    if cyc_df.empty:
-                        continue
-                    cyc_df = cyc_df.sort_values("Strain").reset_index(drop=True)
-                else:
-                    # synthesize with M1
-                    if model is None:
-                        continue
-                    half_len = args.synth_half_length
-                    fd = fake_loop_dataset(cyc, strain_amp_pct if strain_amp_pct is not None else 1.0, material, heat, half_len)
-                    # Normalize using mean_std
-                    fd_norm = normalize_with_table(
-                        fd.rename(columns={"Strain": "Strain 1 %"}),  # mean_std came from M1 training schema
-                        args.m1_mean_std,
-                    )
-                    # Columns for M1
-                    feat = ["Strain 1 %", "Cycle", "Strain Amplitude", "Material", "Heat Treatment", "Strain - 1"]
-                    y_pred = model.predict(fd_norm[feat], verbose=0).ravel()
-                    # Inverse to original stress units
-                    y_pred = inverse_from_table(y_pred.reshape(-1, 1), args.m1_mean_std, target_col="Stress MPa").ravel()
-                    cyc_df = pd.DataFrame({"Strain": fd["Strain"].values / 100.0,  # convert % to fraction
-                                           "Cycle": fd["Cycle"].values,
-                                           "Stress": y_pred})
+            cycles = _log_spaced_cycles(args.min_cycle, max_cycle, args.log_points)
 
-                # split branches
-                upper, lower = identify_upper_lower_loops(cyc_df)
+            for cyc in cycles:
+                sub_df = df[df["Cycle"] == cyc].copy()
+                if sub_df.empty:
+                    idx_near = int((df["Cycle"] - cyc).abs().idxmin())
+                    cyc_near = int(df.loc[idx_near, "Cycle"])
+                    sub_df = df[df["Cycle"] == cyc_near].copy()
+                    cyc = cyc_near
 
-                # εIP from upper
-                eps_ip, sig_ip = inflection_point_upper(upper)
+                feat = extract_loop_features(sub_df[["Strain", "Stress"]], cfg=cfg, strain_units=args.strain_units)
 
-                # σyT from lower
-                tys_x, tys_y, lin1, lin2 = tangents_and_tys_lower(lower)
+                row = {
+                    "Filename": fname,
+                    "Folder": subname,
+                    "Material": int(material),
+                    "Heat Treatment": int(heat),
+                    "Cycle": int(cyc),
+                    "Nf": float(nf),
+                    "Relative Cycle": float(cyc) / float(nf) if nf > 0 else float("nan"),
+                }
+                row.update(feat)
+                rows.append(row)
 
-                # σ̇_T from lower after σyT
-                sigma_dot_GPa = twinning_gradient_postyield(lower, tys_x, strain_fractional=True)
+            print(f"[M2] Processed {fname} in {subname}")
 
-                # extremes
-                sig_mt = float(np.nanmax(cyc_df["Stress"].values))  # MPa
-                sig_mc = float(np.nanmin(cyc_df["Stress"].values))  # MPa
-                # ε at σMT on upper
-                if len(upper):
-                    i_mt = int(np.nanargmax(upper["Stress"].values))
-                    eps_mt = float(upper["Strain"].values[i_mt])
-                else:
-                    eps_mt = np.nan
+    if not rows:
+        raise RuntimeError("[M2] No results were produced. Check input paths and CSV format.")
 
-                # Energies
-                # Loop area ΔWp with proper units
-                loop_area_mpa = polygon_loop_area(cyc_df["Strain"].values, cyc_df["Stress"].values)
-                dWp_kj_per_m3 = abs(loop_area_mpa) * 1e6 / 1000.0
-
-                dWe_plus_kj_per_m3 = we_plus_tangent(upper, eps_ip, sig_ip, eps_mt, mode="tangent_at_inflection")
-
-                # Relative cycle
-                rel = float(cyc / max_cycle)
-
-                rows.append(
-                    {
-                        "Filename": fname,
-                        "Strain Amplitude (%)": strain_amp_pct if strain_amp_pct is not None else np.nan,
-                        "Frequency (Hz)": freq_hz if freq_hz is not None else np.nan,
-                        "Material": material,
-                        "Heat Treatment": heat,
-                        "Cycle": int(cyc),
-                        "Relative Cycle": rel,
-                        "Inflection Strain (%)": eps_ip * 100.0 if np.isfinite(eps_ip) else np.nan,
-                        "Inflection Stress (MPa)": sig_ip if np.isfinite(sig_ip) else np.nan,
-                        "TYS Strain (%)": tys_x * 100.0 if np.isfinite(tys_x) else np.nan,
-                        "TYS Stress (MPa)": tys_y if np.isfinite(tys_y) else np.nan,
-                        "Twinning Gradient (GPa)": sigma_dot_GPa if np.isfinite(sigma_dot_GPa) else np.nan,
-                        "Wp (kJ/m3)": dWp_kj_per_m3 if np.isfinite(dWp_kj_per_m3) else np.nan,
-                        "We (kJ/m3)": dWe_plus_kj_per_m3 if np.isfinite(dWe_plus_kj_per_m3) else np.nan,
-                        "Mean Stress (MPa)": 0.5 * (sig_mt + sig_mc),
-                        "Tensile Peak Stress (MPa)": sig_mt,
-                        "Compressive Peak Stress (MPa)": sig_mc,
-                    }
-                )
-
-                if args.save_plots and (idx_c % max(1, args.plot_every) == 0):
-                    inf_pair = (eps_ip, sig_ip)
-                    tys_pair = (tys_x, tys_y)
-                    plot_path = os.path.join(out_root, f"{os.path.splitext(fname)[0]}__cycle_{int(cyc)}.png")
-                    plot_results(cyc_df, upper, lower, inf_pair, tys_pair, lin1, lin2, cyc, plot_path)
-
-            print(f"Processed {fname} in {subname}")
-
-    # Save master results
     res = pd.DataFrame(rows)
-    csv_main = os.path.join(out_root, "calculation_results.csv")
-    res.to_csv(csv_main, index=False)
-    print(f"Saved: {csv_main}")
-
-    # Per-file min-max scaling for selected columns
-    cols_scale = [
-        "Inflection Strain (%)",
-        "Inflection Stress (MPa)",
-        "TYS Strain (%)",
-        "TYS Stress (MPa)",
-        "Twinning Gradient (GPa)",
-    ]
-    scaled_blocks = []
-    for file_id, grp in res.groupby("Filename"):
-        g = grp.copy()
-        for c in cols_scale:
-            if c in g.columns:
-                vmin = np.nanmin(g[c].values)
-                vmax = np.nanmax(g[c].values)
-                if np.isfinite(vmin) and np.isfinite(vmax) and vmax > vmin:
-                    g[c] = (g[c] - vmin) / (vmax - vmin)
-        scaled_blocks.append(g)
-    res_scaled = pd.concat(scaled_blocks, ignore_index=True)
-    csv_scaled = os.path.join(out_root, "calculation_results_with_scaling.csv")
-    res_scaled.to_csv(csv_scaled, index=False)
-    print(f"Saved: {csv_scaled}")
-
-    print(f"Outputs stored in: {out_root}")
+    out_csv = os.path.join(out_root, "calculation_results.csv")
+    res.to_csv(out_csv, index=False)
+    print(f"[M2] Saved: {out_csv}")
 
 
 if __name__ == "__main__":
     main()
+
