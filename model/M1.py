@@ -1,68 +1,101 @@
 
+# -*- coding: utf-8 -*-
 """
-M1 preprocessing + ANN training (distribution-ready)
+M1 ANN training script (distribution / paper-aligned)
 
-- Recursively reads raw loop CSVs from subdirectories of --data_root
-- Selects evenly spaced cycles and samples points within each cycle
-- Builds lagged strain feature per cycle
-- Splits train/validation, scales FEATURES and TARGET separately
-- Trains a Keras ANN to predict stress from features
-- Saves model, scalers, logs, and demo predictions to outputs/
+Goal
+- Predict stress within a hysteresis loop using 6 inputs:
+  1) Material (binary)
+  2) Extrusion Temperature (binary or numeric descriptor)
+  3) Strain Amplitude (%)
+  4) Cycle
+  5) Strain within loop (%)
+  6) Lagged Strain (%)
+
+Paper alignment
+- Activation: LeakyReLU(alpha=0.01)
+- Loss: Huber
+- Architecture (final): 6 hidden layers with units:
+  97, 102, 70, 47, 67, 70
+- Learning rate: 10^(-3.74)
+
+Notes
+- This script is designed for anonymized distribution.
+  It supports flexible folder naming rules and column naming.
+- "Material" is kept as a binary categorical code without standardization by default,
+  while other continuous inputs are standardized.
 """
 
-import argparse
-import json
 import os
 import re
+import argparse
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-import matplotlib.pyplot as plt
 
 
 # -----------------------------
-# Utilities
+# Utilities: metadata parsing
 # -----------------------------
-def set_seed(seed: int = 42):
-    np.random.seed(seed)
-    tf.random.set_seed(seed)
-
-
-def mkdir(path: str):
-    os.makedirs(path, exist_ok=True)
-
-
-def find_subdirs(root: str, include: list[str] | None) -> list[str]:
-    if include:
-        return [os.path.join(root, sd) for sd in include]
-    # default: all immediate subdirectories
-    return [os.path.join(root, d) for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
-
-
-def infer_material_and_heat(subdir_name: str) -> tuple[int, int]:
-    # material: 0 for AZ91, 1 for others by default
-    material = 0 if re.search(r"AZ91", subdir_name, re.IGNORECASE) else 1
-    # heat treatment: 300 if contains 300 else 400 (fallback)
-    heat = 300 if re.search(r"300", subdir_name) else 400
-    return material, heat
-
-
-def parse_filename_tokens(fname_stem: str) -> tuple[float | None, float | None]:
+def extract_metadata_from_folder(folder_name: str):
     """
-    Extracts strain amplitude in percent and frequency in hz from filename tokens.
-    Accepts formats like '4-1 1,2% 0.2hz.csv' or '... 1.2% 0.5Hz ...'
-    Returns (strain_amp_percent, frequency_hz) possibly None if not found.
+    Returns (material_code, extrusion_code)
+
+    Supports anonymous tokens:
+      - Material: MAT0, MAT1
+      - Process temp: TEMP0, TEMP1, LT, HT
+    Also tolerates legacy tokens if present.
+
+    If not detected, returns (0, 0) as safe defaults.
+    """
+    name = folder_name.upper()
+
+    # Material
+    if "MAT1" in name:
+        material = 1
+    elif "MAT0" in name:
+        material = 0
+    else:
+        # Backward-tolerant tokens (optional)
+        if "SEN9" in name:
+            material = 1
+        elif "AZ91" in name:
+            material = 0
+        else:
+            material = 0
+
+    # Extrusion temperature / processing condition
+    if "TEMP1" in name or "HT" in name:
+        ext = 1
+    elif "TEMP0" in name or "LT" in name:
+        ext = 0
+    else:
+        # Try to capture a numeric token e.g., 573, 673
+        m = re.search(r"(5\d{2}|6\d{2}|7\d{2})", name)
+        if m:
+            ext = float(m.group(1))
+        else:
+            ext = 0
+
+    return material, ext
+
+
+def parse_filename_tokens(fname_stem: str):
+    """
+    Extract strain amplitude in percent from filename tokens.
+    Accepts tokens like "... 1.2% ..." or "... 1,2% ...".
     """
     toks = re.split(r"[ _\-]+", fname_stem)
     strain = None
-    freq = None
     for t in toks:
         t_clean = t.replace(",", ".")
         if "%" in t_clean:
@@ -70,74 +103,40 @@ def parse_filename_tokens(fname_stem: str) -> tuple[float | None, float | None]:
                 strain = float(t_clean.replace("%", ""))
             except Exception:
                 pass
-        if re.search(r"hz$", t_clean, re.IGNORECASE):
-            try:
-                freq = float(re.sub(r"hz$", "", t_clean, flags=re.IGNORECASE))
-            except Exception:
-                pass
-    return strain, freq
+    return strain
 
 
-def pick_cycles(max_cycle: int, start: int, n_cycles: int) -> list[int]:
+def pick_cycles(max_cycle: int, start: int, n_cycles: int):
     if max_cycle <= start + 3:
         return list(range(1, max_cycle + 1))
     n = min(n_cycles, max(1, max_cycle - start - 2))
     return list(np.linspace(start, max_cycle - 3, n, dtype=int))
 
 
-def sample_within_cycle(df_cycle: pd.DataFrame, sampling_rate: float) -> pd.DataFrame:
+def sample_within_cycle(df_cycle: pd.DataFrame, sampling_rate: float):
+    """
+    sampling_rate = fraction of points kept within a cycle.
+    Default is 0.70 to approximate 'undersampled by 30%' conceptually.
+    """
     n = max(1, int(len(df_cycle) * sampling_rate))
     idx = np.linspace(0, len(df_cycle) - 1, n, dtype=int)
     return df_cycle.iloc[idx]
 
 
-def add_lagged_strain(df: pd.DataFrame, strain_col: str, cycle_col: str, new_col: str = "Strain - 1") -> pd.DataFrame:
+def add_lagged_strain(df: pd.DataFrame, strain_col: str, cycle_col: str, new_col: str = "Strain - 1"):
     df[new_col] = df.groupby(cycle_col)[strain_col].shift(1)
-    # fill first lag by last value within the same cycle
     df[new_col] = df[new_col].fillna(df.groupby(cycle_col)[strain_col].transform("last"))
     return df
 
 
-def save_mean_std_csv(path: str, feature_scaler: StandardScaler, target_scaler: StandardScaler, feature_cols: list[str], target_col: str):
-    # build a unified table indexed by column name
+def save_feature_mean_std(path: str, scaler: StandardScaler, scale_cols: list[str]):
     d = {}
-    for col, m, s in zip(feature_cols, feature_scaler.mean_, feature_scaler.scale_):
+    for col, m, s in zip(scale_cols, scaler.mean_, scaler.scale_):
         d[col] = {"mean": float(m), "std": float(s)}
-    d[target_col] = {"mean": float(target_scaler.mean_[0]), "std": float(target_scaler.scale_[0])}
-    df = pd.DataFrame.from_dict(d, orient="index")
-    df.to_csv(path)
+    pd.DataFrame.from_dict(d, orient="index").to_csv(path)
 
 
-def fake_dataset(half_cycle: int, strain_amp_percent: float, material: int, heat: int, half_length: int) -> pd.DataFrame:
-    """
-    Builds a synthetic loop at a specific half-life 'cycle', with symmetric strain path.
-    Returns columns: Cycle, Strain 1 %, Strain - 1, Strain Amplitude, Material, Heat Treatment
-    """
-    cycle = np.full(half_length * 2 - 2, half_cycle)
-    amp = strain_amp_percent
-    s1 = np.linspace(-amp, amp, half_length)  # percent units
-    s_m = s1[::-1][1:-1]  # remove duplicated endpoints
-    s = np.concatenate([s1, s_m])
-    s_lag = np.concatenate([[s[-1]], s[:-1]])
-
-    df = pd.DataFrame(
-        {
-            "Cycle": cycle,
-            "Strain 1 %": s,
-            "Strain - 1": s_lag,
-            "Strain Amplitude": np.full_like(s, amp),
-            "Material": np.full_like(s, material),
-            "Heat Treatment": np.full_like(s, heat),
-        }
-    )
-    return df
-
-
-# -----------------------------
-# Model builders
-# -----------------------------
-def build_paper_ann(input_dim: int, alpha: float = 0.01) -> keras.Model:
-    # 6 hidden layers as described in Methods with LeakyReLU
+def build_paper_ann(input_dim: int, alpha: float = 0.01):
     inputs = keras.Input(shape=(input_dim,))
     x = layers.Dense(97)(inputs)
     x = layers.LeakyReLU(alpha=alpha)(x)
@@ -152,110 +151,122 @@ def build_paper_ann(input_dim: int, alpha: float = 0.01) -> keras.Model:
     x = layers.Dense(70)(x)
     x = layers.LeakyReLU(alpha=alpha)(x)
     outputs = layers.Dense(1, activation="linear")(x)
-    model = keras.Model(inputs, outputs, name="m1_ann_paper")
-    return model
+    return keras.Model(inputs, outputs, name="m1_ann_paper")
+
+
+def make_feature_matrix(df: pd.DataFrame, feature_cols: list[str], scaler: StandardScaler, scale_cols: list[str]):
+    tmp = df[feature_cols].copy()
+
+    if scale_cols:
+        scaled = scaler.transform(tmp[scale_cols].values)
+        tmp.loc[:, scale_cols] = scaled
+
+    return tmp.values.astype(np.float32)
 
 
 # -----------------------------
 # CLI
 # -----------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="M1 preprocessing and ANN training")
+    p = argparse.ArgumentParser(description="M1 preprocessing and ANN training (paper-aligned)")
+
     # I/O
-    p.add_argument("--data_root", type=str, required=True, help="Root folder containing subdirectories of CSV files")
-    p.add_argument("--subdirs", type=str, default="", help="Comma separated subfolder names to include. Default uses all immediate subfolders")
-    p.add_argument("--outdir", type=str, default="outputs", help="Output root directory")
+    p.add_argument("--data_root", type=str, required=True,
+                   help="Root folder containing subdirectories of raw CSV files")
+    p.add_argument("--subdirs", type=str, default="",
+                   help="Comma-separated subfolder names to include. Default uses all immediate subfolders")
+    p.add_argument("--outdir", type=str, default="outputs",
+                   help="Output root directory")
 
     # Raw CSV format
-    p.add_argument("--cols", type=str, default="3,4,5", help="Zero based indices for columns strain, cycle, stress. Example 3,4,5")
-    p.add_argument("--header", type=int, default=0, help="CSV header row index. Use None for no header")
-    p.add_argument("--sep", type=str, default=",", help="CSV delimiter")
+    p.add_argument("--cols", type=str, default="3,4,5",
+                   help="Zero-based indices for columns: strain, cycle, stress. Example 3,4,5")
+    p.add_argument("--header", type=str, default="0",
+                   help="CSV header row index. Use 'None' for no header")
+    p.add_argument("--sep", type=str, default=",")
 
     # Cycle sampling
-    p.add_argument("--cycle_start", type=int, default=30, help="First cycle considered for sampling")
-    p.add_argument("--n_cycles", type=int, default=60, help="Number of cycles to sample evenly across the test")
-    p.add_argument("--sample_rate", type=float, default=0.30, help="Fraction of points sampled within each cycle")
+    p.add_argument("--cycle_start", type=int, default=30)
+    p.add_argument("--n_cycles", type=int, default=60)
+    p.add_argument("--sample_rate", type=float, default=0.70,
+                   help="Fraction of points kept within each sampled cycle")
 
-    # Split and scaling
-    p.add_argument("--val_size", type=float, default=0.2, help="Validation fraction")
-    p.add_argument("--seed", type=int, default=42, help="Random seed")
+    # Split
+    p.add_argument("--val_size", type=float, default=0.2)
+    p.add_argument("--seed", type=int, default=42)
 
     # Training
-    p.add_argument("--epochs", type=int, default=20000, help="Training epochs")
-    p.add_argument("--batch", type=int, default=64, help="Batch size")
-    p.add_argument("--lr", type=float, default=10 ** (-3.74), help="Learning rate. Default approx 1.82e-4")
-    p.add_argument("--arch", type=str, default="paper", choices=["paper", "deep"], help="ANN architecture choice")
-    p.add_argument("--huber_delta", type=float, default=1.0, help="Huber loss delta")
+    p.add_argument("--epochs", type=int, default=3000)
+    p.add_argument("--batch", type=int, default=256)
+    p.add_argument("--lr", type=float, default=10 ** (-3.74))
+    p.add_argument("--alpha", type=float, default=0.01)
 
-    # Demo prediction
-    p.add_argument("--demo", action="store_true", help="Run a demo prediction on a synthetic loop")
-    p.add_argument("--demo_half_cycle", type=int, default=200)
-    p.add_argument("--demo_strain_amp", type=float, default=1.2)
-    p.add_argument("--demo_material", type=int, default=1)
-    p.add_argument("--demo_heat", type=int, default=400)
-    p.add_argument("--demo_half_length", type=int, default=15)
+    # Column names (for post-processing outputs)
+    p.add_argument("--col_strain", type=str, default="Strain 1 %")
+    p.add_argument("--col_cycle", type=str, default="Cycle")
+    p.add_argument("--col_stress", type=str, default="Stress MPa")
+    p.add_argument("--col_amp", type=str, default="Strain Amplitude (%)")
+    p.add_argument("--col_material", type=str, default="Material")
+    p.add_argument("--col_extrusion", type=str, default="Extrusion Temperature")
+    p.add_argument("--col_lag", type=str, default="Strain - 1")
 
     return p.parse_args()
 
 
-# -----------------------------
-# Main
-# -----------------------------
 def main():
     args = parse_args()
-    set_seed(args.seed)
 
-    subdirs = [s.strip() for s in args.subdirs.split(",") if s.strip()] if args.subdirs else None
-    col_idx = [int(x) for x in args.cols.split(",")]
-    if len(col_idx) != 3:
-        raise ValueError("Provide exactly three column indices for strain, cycle, stress")
+    os.makedirs(args.outdir, exist_ok=True)
+    col_idx = [int(c.strip()) for c in args.cols.split(",")]
 
-    # Prepare output folders
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_root = os.path.join(args.outdir, f"m1_{stamp}")
-    mkdir(out_root)
+    header = None if str(args.header).lower() == "none" else int(args.header)
 
-    # ------------------ Preprocessing ------------------
+    # Determine subfolders
+    if args.subdirs.strip():
+        subfolders = [s.strip() for s in args.subdirs.split(",")]
+        subfolders = [os.path.join(args.data_root, s) for s in subfolders]
+    else:
+        subfolders = [os.path.join(args.data_root, d) for d in os.listdir(args.data_root)
+                      if os.path.isdir(os.path.join(args.data_root, d))]
+
     processed = []
-    for folder in find_subdirs(args.data_root, subdirs):
-        subname = os.path.basename(folder)
-        if not os.path.isdir(folder):
-            continue
-        material, heat = infer_material_and_heat(subname)
 
-        for fname in os.listdir(folder):
+    for sub in subfolders:
+        folder_name = os.path.basename(sub)
+        material_code, extrusion_code = extract_metadata_from_folder(folder_name)
+
+        for fname in os.listdir(sub):
             if not fname.lower().endswith(".csv"):
                 continue
-            fpath = os.path.join(folder, fname)
+
+            fpath = os.path.join(sub, fname)
+            stem = os.path.splitext(fname)[0]
+            strain_amp_percent = parse_filename_tokens(stem)
+
             try:
-                # filename metadata
-                stem = os.path.splitext(fname)[0]
-                strain_amp_percent, freq_hz = parse_filename_tokens(stem)
+                raw = pd.read_csv(fpath, header=header, sep=args.sep)
 
-                # load raw
-                header = None if str(args.header).lower() == "none" else args.header
-                df = pd.read_csv(fpath, header=header, sep=args.sep)
+                use = raw.iloc[:, col_idx].copy()
+                use.columns = [args.col_strain, args.col_cycle, args.col_stress]
 
-                # select columns by index and rename
-                use = df.iloc[:, col_idx].copy()
-                use.columns = ["Strain 1 %", "Cycle", "Stress MPa"]
-
-                # choose cycles then subsample within cycle
-                max_cycle = int(np.nanmax(use["Cycle"].values))
+                # Cycle selection + within-cycle sampling
+                max_cycle = int(np.nanmax(use[args.col_cycle].values))
                 cycles = pick_cycles(max_cycle=max_cycle, start=args.cycle_start, n_cycles=args.n_cycles)
-                use = use[use["Cycle"].isin(cycles)]
-                use = use.groupby("Cycle", group_keys=False).apply(lambda g: sample_within_cycle(g, args.sample_rate))
+                use = use[use[args.col_cycle].isin(cycles)]
+                use = use.groupby(args.col_cycle, group_keys=False).apply(
+                    lambda g: sample_within_cycle(g, args.sample_rate)
+                )
 
-                # add metadata columns
+                # Strain amplitude
                 if strain_amp_percent is None:
-                    # if not found in filename, compute from data or leave NaN
-                    strain_amp_percent = float(np.abs(use["Strain 1 %"]).max())
-                use["Strain Amplitude"] = strain_amp_percent
-                use["Material"] = material
-                use["Heat Treatment"] = heat
+                    strain_amp_percent = float(np.abs(use[args.col_strain]).max())
 
-                # add lagged strain per cycle
-                use = add_lagged_strain(use, strain_col="Strain 1 %", cycle_col="Cycle", new_col="Strain - 1")
+                use[args.col_amp] = strain_amp_percent
+                use[args.col_material] = material_code
+                use[args.col_extrusion] = extrusion_code
+
+                # Lagged strain
+                use = add_lagged_strain(use, strain_col=args.col_strain, cycle_col=args.col_cycle, new_col=args.col_lag)
 
                 processed.append(use)
 
@@ -263,129 +274,101 @@ def main():
                 print(f"Skip {fpath} due to error: {e}")
 
     if not processed:
-        raise RuntimeError("No CSVs processed. Check --data_root, --subdirs, and --cols.")
+        raise RuntimeError("No CSVs processed. Check --data_root, --subdirs, --cols.")
 
     final_df = pd.concat(processed, ignore_index=True)
 
     # Save raw processed log
-    log_csv = os.path.join(out_root, "log.csv")
+    log_csv = os.path.join(args.outdir, "m1_processed_log.csv")
     final_df.to_csv(log_csv, index=False)
 
-    # ------------------ Split and scaling ------------------
-    features = ["Strain 1 %", "Cycle", "Strain Amplitude", "Material", "Heat Treatment", "Strain - 1"]
-    target = "Stress MPa"
+    # Feature set (paper order)
+    FEATURES = [args.col_strain, args.col_cycle, args.col_amp,
+                args.col_material, args.col_extrusion, args.col_lag]
+    TARGET = args.col_stress
 
+    # Train/val split
     train_df, val_df = train_test_split(final_df, test_size=args.val_size, random_state=args.seed)
 
-    X_train = train_df[features].values
-    X_val = val_df[features].values
-    y_train = train_df[[target]].values
-    y_val = val_df[[target]].values
+    # Selective standardization:
+    # keep material as binary code, standardize others
+    NON_SCALED = [args.col_material]
+    SCALE_COLS = [c for c in FEATURES if c not in NON_SCALED]
 
-    # scale features and target separately
     x_scaler = StandardScaler()
-    y_scaler = StandardScaler()
+    x_scaler.fit(train_df[SCALE_COLS].values)
 
-    X_train_s = x_scaler.fit_transform(X_train)
-    X_val_s = x_scaler.transform(X_val)
-    y_train_s = y_scaler.fit_transform(y_train)
-    y_val_s = y_scaler.transform(y_val)
+    X_train = make_feature_matrix(train_df, FEATURES, x_scaler, SCALE_COLS)
+    X_val = make_feature_matrix(val_df, FEATURES, x_scaler, SCALE_COLS)
+    y_train = train_df[TARGET].values.astype(np.float32)
+    y_val = val_df[TARGET].values.astype(np.float32)
 
-    # Save scaled CSVs for reproducibility
-    train_scaled = pd.DataFrame(np.hstack([X_train_s, y_train_s]), columns=features + [target])
-    val_scaled = pd.DataFrame(np.hstack([X_val_s, y_val_s]), columns=features + [target])
+    # Save scaler stats
+    mean_std_path = os.path.join(args.outdir, "m1_feature_mean_std.csv")
+    save_feature_mean_std(mean_std_path, x_scaler, SCALE_COLS)
 
-    train_scaled.to_csv(os.path.join(out_root, "train_data.csv"), index=False)
-    val_scaled.to_csv(os.path.join(out_root, "validation_data.csv"), index=False)
-    save_mean_std_csv(os.path.join(out_root, "mean_std.csv"), x_scaler, y_scaler, features, target)
+    # Build model
+    model = build_paper_ann(input_dim=len(FEATURES), alpha=args.alpha)
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=args.lr),
+        loss=tf.keras.losses.Huber(),
+        metrics=[keras.metrics.MeanSquaredError(name="mse"),
+                 keras.metrics.MeanAbsoluteError(name="mae")]
+    )
 
-    # ------------------ Model and training ------------------
-    input_dim = len(features)
-    if args.arch == "paper":
-        model = build_paper_ann(input_dim)
-    else:
-        model = build_deep_ann(input_dim)
+    callbacks = [
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5, patience=30, min_lr=1e-6, verbose=1
+        ),
+        keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=120, restore_best_weights=True, verbose=1
+        ),
+    ]
 
-    opt = keras.optimizers.Adam(learning_rate=args.lr)
-    loss = keras.losses.Huber(delta=args.huber_delta)
-    model.compile(optimizer=opt, loss=loss)
-
-    hist = model.fit(
-        X_train_s, y_train_s,
-        validation_data=(X_val_s, y_val_s),
+    print("=== Training M1 ANN ===")
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
         epochs=args.epochs,
         batch_size=args.batch,
+        callbacks=callbacks,
         verbose=2
     )
 
-    # Save model
-    model_path = os.path.join(out_root, "ann_model.keras")
-    model.save(model_path)
-
-    # ------------------ Plots ------------------
-    # Learning curves
-    y_vloss = hist.history.get("val_loss", [])
-    y_loss = hist.history.get("loss", [])
-    x_len = np.arange(len(y_loss))
-
-    plt.figure(figsize=(7, 6))
-    plt.plot(x_len, y_vloss, marker=".", label="Validation loss")
-    plt.plot(x_len, y_loss, marker=".", label="Train loss")
+    # Loss curve
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    plt.figure(figsize=(6, 4))
+    plt.plot(history.history["loss"], label="train")
+    plt.plot(history.history["val_loss"], label="validation")
+    plt.yscale("log")
     plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.grid(True, ls="--", alpha=0.6)
+    plt.ylabel("Loss (Huber)")
     plt.legend()
+    plt.grid(True)
     plt.tight_layout()
-    plt.savefig(os.path.join(out_root, "learning_curves.png"), dpi=200)
+    loss_path = os.path.join(args.outdir, f"m1_loss_{stamp}.png")
+    plt.savefig(loss_path, dpi=300)
     plt.close()
 
-    # ------------------ Demo prediction (optional) ------------------
-    if args.demo:
-        demo = fake_dataset(
-            half_cycle=args.demo_half_cycle,
-            strain_amp_percent=args.demo_strain_amp,
-            material=args.demo_material,
-            heat=args.demo_heat,
-            half_length=args.demo_half_length,
-        )
+    # Save model
+    model_path = os.path.join(args.outdir, f"m1_model_{stamp}.h5")
+    model.save(model_path)
 
-        # scale using stored scalers
-        X_demo = demo[features].values
-        X_demo_s = x_scaler.transform(X_demo)
-        y_pred_s = model.predict(X_demo_s, verbose=0)
-        # inverse scale
-        y_pred = y_scaler.inverse_transform(y_pred_s)
-
-        demo_out = demo.copy()
-        demo_out[target] = y_pred.ravel()
-        demo_csv = os.path.join(out_root, "demo_predictions.csv")
-        demo_out.to_csv(demo_csv, index=False)
-
-        # plot stress vs strain
-        plt.figure(figsize=(7, 6))
-        plt.plot(demo_out["Strain 1 %"], demo_out[target], label="Predicted stress MPa")
-        plt.xlabel("Strain 1 %")
-        plt.ylabel("Stress MPa")
-        plt.grid(True, ls="--", alpha=0.6)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_root, "demo_loop.png"), dpi=200)
-        plt.close()
-
-    # ------------------ Save config ------------------
-    cfg = vars(args).copy()
-    cfg["outdir"] = out_root
-    with open(os.path.join(out_root, "config.json"), "w") as f:
-        json.dump(cfg, f, indent=2)
-
-    print(f"\nSaved outputs to {out_root}")
-    print(f"- Preprocessed log: {log_csv}")
-    print(f"- Train and val CSVs: train_data.csv, validation_data.csv")
-    print(f"- Mean and std: mean_std.csv")
-    print(f"- Model: ann_model.keras")
-    if args.demo:
-        print(f"- Demo predictions: demo_predictions.csv")
+    print(f"Processed log saved to: {log_csv}")
+    print(f"Feature mean/std saved to: {mean_std_path}")
+    print(f"Loss curve saved to: {loss_path}")
+    print(f"Model saved to: {model_path}")
 
 
 if __name__ == "__main__":
+    # GPU safe setup
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+        except Exception:
+            pass
+
     main()
+
