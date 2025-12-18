@@ -1,278 +1,354 @@
+# -*- coding: utf-8 -*-
+r"""
+M3 BNN training script
 
+Input
+calculation_results.csv
+
+Features
+Strain Amplitude (%), Material, Heat Treatment
+Wp (kJ/m3), We (kJ/m3)
+Tensile Peak Stress (MPa), Compressive Peak Stress (MPa)
+Inflection Strain (%), TYS Stress (MPa), Twinning Gradient (GPa)
+
+Target
+Relative Cycle (N/Nf)
+
+Notes
+Keeps per epoch loss arrays
+Plots raw and EMA smoothed loss curves
+Saves model state dict, scaler, loss plot
+Includes early stopping based on validation objective
+To disable early stopping set patience to 0
 """
-M3: Bayesian neural network for low-cycle fatigue life prediction
 
-- Clean paths and CLI flags for distribution
-- Train/test split by a user-selected target strain amplitude
-- Baseline vs enhanced feature sets
-- PP score, parity plot, per-sample scores
-"""
-
-import argparse
 import os
-from datetime import datetime
-import random
+import datetime
+
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchbnn as bnn
-from sklearn.preprocessing import MinMaxScaler
-import matplotlib.pyplot as plt
 
 
-# -----------------------------
-# Utilities
-# -----------------------------
-def set_seed(seed: int = 42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+# =========================
+# Paths
+# =========================
+BASE_DIR = r"F:\Paperwork\AZ91+SEN9_lowcyclefatigue"
+BNN_DATA_CSV = os.path.join(BASE_DIR, "calculation_results.csv")
+
+BNN_SAVE_ROOT = os.path.join(BASE_DIR, r"ML\BNN models\full_amplitude")
+os.makedirs(BNN_SAVE_ROOT, exist_ok=True)
 
 
-def ensure_columns(df: pd.DataFrame, required_cols: list):
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns in CSV: {missing}")
+# =========================
+# Columns
+# =========================
+COMMON_COLS = ["Strain Amplitude (%)", "Material", "Heat Treatment"]
+BASELINE_COLS = [
+    "Wp (kJ/m3)",
+    "We (kJ/m3)",
+    "Tensile Peak Stress (MPa)",
+    "Compressive Peak Stress (MPa)",
+]
+ENHANCED_COLS = [
+    "Inflection Strain (%)",
+    "TYS Stress (MPa)",
+    "Twinning Gradient (GPa)",
+]
+
+INPUT_COLS = COMMON_COLS + BASELINE_COLS + ENHANCED_COLS
+TARGET_COL = "Relative Cycle"
 
 
-def to_tensor(x, dtype=torch.float32):
-    return torch.tensor(x, dtype=dtype)
+# =========================
+# Load data
+# =========================
+print("=== Loading data for BNN ===")
+df = pd.read_csv(BNN_DATA_CSV)
+
+missing = [c for c in INPUT_COLS + [TARGET_COL] if c not in df.columns]
+if missing:
+    raise ValueError(f"Missing columns in {BNN_DATA_CSV}: {missing}")
+
+df = df.dropna(subset=INPUT_COLS + [TARGET_COL]).reset_index(drop=True)
+
+X = df[INPUT_COLS].values.astype(np.float32)
+y = df[TARGET_COL].values.astype(np.float32).reshape(-1, 1)
+
+print(f"Total samples: {X.shape[0]}")
 
 
-# -----------------------------
+# =========================
+# Train val split and scaling
+# =========================
+X_train, X_val, y_train, y_val = train_test_split(
+    X,
+    y,
+    test_size=0.2,
+    random_state=42,
+)
+
+scaler = MinMaxScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_val_scaled = scaler.transform(X_val)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32, device=device)
+y_train_tensor = torch.tensor(y_train, dtype=torch.float32, device=device)
+X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32, device=device)
+y_val_tensor = torch.tensor(y_val, dtype=torch.float32, device=device)
+
+
+# =========================
 # Model
-# -----------------------------
+# =========================
 class TorchBNN(nn.Module):
-    def __init__(self, input_dim: int, hidden: int = 64, prior_mu: float = 0.0, prior_sigma: float = 0.1):
+    def __init__(self, input_dim: int):
         super().__init__()
-        self.net = nn.Sequential(
-            bnn.BayesLinear(prior_mu=prior_mu, prior_sigma=prior_sigma, in_features=input_dim, out_features=hidden),
+        self.bnn = nn.Sequential(
+            bnn.BayesLinear(
+                prior_mu=0.0,
+                prior_sigma=0.1,
+                in_features=input_dim,
+                out_features=256,
+            ),
             nn.ReLU(),
-            bnn.BayesLinear(prior_mu=prior_mu, prior_sigma=prior_sigma, in_features=hidden, out_features=hidden),
+            bnn.BayesLinear(
+                prior_mu=0.0,
+                prior_sigma=0.1,
+                in_features=256,
+                out_features=256,
+            ),
             nn.ReLU(),
-            bnn.BayesLinear(prior_mu=prior_mu, prior_sigma=prior_sigma, in_features=hidden, out_features=1),
+            bnn.BayesLinear(
+                prior_mu=0.0,
+                prior_sigma=0.1,
+                in_features=256,
+                out_features=128,
+            ),
+            nn.ReLU(),
+            bnn.BayesLinear(
+                prior_mu=0.0,
+                prior_sigma=0.1,
+                in_features=128,
+                out_features=64,
+            ),
+            nn.ReLU(),
+            bnn.BayesLinear(
+                prior_mu=0.0,
+                prior_sigma=0.1,
+                in_features=64,
+                out_features=1,
+            ),
         )
 
     def forward(self, x):
-        return self.net(x)
+        return self.bnn(x)
 
 
-def train_bnn(model: nn.Module,
-              X: np.ndarray,
-              y: np.ndarray,
-              n_epochs: int = 20000,
-              lr: float = 1e-3,
-              kl_weight: float = 1e-2,
-              log_every: int = 1000):
+# =========================
+# Smoothing utilities
+# =========================
+def ema(arr, alpha=0.02):
+    arr = np.asarray(arr, dtype=np.float32)
+    out = np.empty_like(arr, dtype=np.float32)
+    out[0] = arr[0]
+    for i in range(1, len(arr)):
+        out[i] = alpha * arr[i] + (1 - alpha) * out[i - 1]
+    return out
+
+
+def moving_average(arr, window=200):
+    arr = np.asarray(arr, dtype=np.float32)
+    if window <= 1:
+        return arr.copy()
+    kernel = np.ones(window, dtype=np.float32) / window
+    return np.convolve(arr, kernel, mode="same").astype(np.float32)
+
+
+# =========================
+# Training
+# =========================
+def train_bnn(
+    n_epochs: int = 50000,
+    kl_weight: float = 0.01,
+    lr: float = 1e-3,
+    patience: int = 3000,
+    min_delta: float = 0.0,
+    log_every: int = 500,
+    n_mc_val: int = 200,
+    mc_infer: int = 100,
+):
+    model = TorchBNN(input_dim=X_train_scaled.shape[1]).to(device)
+
     optimizer = optim.Adam(model.parameters(), lr=lr)
     mse_loss = nn.MSELoss()
-    kl_loss_fn = bnn.BKLLoss(reduction='mean', last_layer_only=False)
+    kl_loss_fn = bnn.BKLLoss(reduction="mean", last_layer_only=False)
 
-    X_tensor = to_tensor(X)
-    y_tensor = to_tensor(y)
+    train_losses = []
+    val_losses = []
 
-    model.train()
+    best_val_loss = float("inf")
+    best_state_dict = None
+    best_epoch = -1
+    no_improve = 0
+
+    print("=== Training BNN (M3) ===")
     for epoch in range(n_epochs):
-        output = model(X_tensor)
-        mse = mse_loss(output, y_tensor)
+        model.train()
+        optimizer.zero_grad()
+
+        out = model(X_train_tensor)
+        mse = mse_loss(out, y_train_tensor)
         kl = kl_loss_fn(model)
         loss = mse + kl_weight * kl
-
-        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        if log_every and (epoch % log_every == 0):
-            print(f"[{epoch}] MSE {mse.item():.6f} KL {kl.item():.6f} Total {loss.item():.6f}")
+        model.eval()
+        with torch.no_grad():
+            out_val = model(X_val_tensor)
+            mse_val = mse_loss(out_val, y_val_tensor)
+            kl_val = kl_loss_fn(model)
+            val_loss = mse_val + kl_weight * kl_val
 
-    return model
+        train_losses.append(float(loss.item()))
+        val_losses.append(float(val_loss.item()))
 
+        improved = val_loss.item() < (best_val_loss - float(min_delta))
+        if improved:
+            best_val_loss = float(val_loss.item())
+            best_epoch = epoch
+            best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
 
-@torch.no_grad()
-def predict_bnn(model: nn.Module, X: np.ndarray, n_samples: int = 100):
+        if log_every and epoch % log_every == 0:
+            print(
+                f"[{epoch:05d}] "
+                f"train_loss={loss.item():.6f} "
+                f"val_loss={val_loss.item():.6f} "
+                f"mse={mse.item():.6f} "
+                f"mse_val={mse_val.item():.6f} "
+                f"no_improve={no_improve}"
+            )
+
+        if patience and no_improve >= int(patience):
+            print(f"Early stopping at epoch {epoch}  no val improvement")
+            break
+
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+
+    train_losses = np.array(train_losses, dtype=np.float32)
+    val_losses = np.array(val_losses, dtype=np.float32)
+    epochs_ran_bnn = int(len(train_losses))
+
+    train_losses_ema = ema(train_losses, alpha=0.02)
+    val_losses_ema = ema(val_losses, alpha=0.02)
+    train_losses_ma = moving_average(train_losses, window=200)
+    val_losses_ma = moving_average(val_losses, window=200)
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_dir = os.path.join(BNN_SAVE_ROOT, timestamp)
+    os.makedirs(save_dir, exist_ok=True)
+
+    plt.figure(figsize=(6, 4))
+    plt.plot(train_losses, alpha=0.25, label="train (raw)")
+    plt.plot(val_losses, alpha=0.25, label="validation (raw)")
+    plt.plot(train_losses_ema, label="train (EMA)")
+    plt.plot(val_losses_ema, label="validation (EMA)")
+    plt.yscale("log")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss  MSE + KL")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+
+    loss_path = os.path.join(save_dir, "BNN_loss.png")
+    plt.savefig(loss_path, dpi=300)
+    plt.show()
+    print(f"BNN loss curve saved to {loss_path}")
+
+    model_path = os.path.join(save_dir, "enhanced_model.pt")
+    torch.save(model.state_dict(), model_path)
+
+    scaler_path = os.path.join(save_dir, "scaler_enhanced.npy")
+    np.save(scaler_path, {"min": scaler.min_, "scale": scaler.scale_}, allow_pickle=True)
+
+    print(f"BNN model saved to {model_path}")
+    print(f"BNN scaler saved to {scaler_path}")
+
+    # MC sampling based validation metrics
     model.eval()
-    X_tensor = to_tensor(X)
-    preds = []
-    for _ in range(n_samples):
-        preds.append(model(X_tensor).numpy())
-    preds = np.stack(preds, axis=0)  # [S, N, 1]
-    mean = preds.mean(axis=0)
-    std = preds.std(axis=0)
-    return mean, std
+    with torch.no_grad():
+        preds = []
+        for _ in range(int(n_mc_val)):
+            preds.append(model(X_val_tensor).cpu().numpy())
+        preds = np.stack(preds, axis=0)
+        mean_pred = preds.mean(axis=0).flatten()
+        std_pred = preds.std(axis=0).flatten()
 
+    y_val_np = y_val.flatten()
+    rmse_val = np.sqrt(np.mean((y_val_np - mean_pred) ** 2))
+    print(f"Validation RMSE on Relative Cycle: {rmse_val:.6f}")
 
-def pp_score(y_true: np.ndarray, mu: np.ndarray, sigma: np.ndarray, eps: float = 1e-8):
-    """Posterior-probability score under a Gaussian likelihood."""
-    s = np.clip(sigma, eps, None)
-    coeff = 1.0 / (np.sqrt(2.0 * np.pi) * s)
-    expo = np.exp(-0.5 * ((y_true - mu) ** 2) / (s ** 2))
-    return coeff * expo  # shape [N, 1]
+    lower = mean_pred - 1.64 * std_pred
+    upper = mean_pred + 1.64 * std_pred
+    coverage = np.mean((y_val_np >= lower) & (y_val_np <= upper))
+    print(f"Approx. 90 percent interval empirical coverage: {coverage:.3f}")
 
+    print(f"Epochs ran (M3): {epochs_ran_bnn} / n_epochs={n_epochs}")
+    print(f"Best val loss epoch: {best_epoch}  best_val_loss={best_val_loss:.6f}")
+    print(f"All outputs saved under: {save_dir}")
 
-# -----------------------------
-# CLI and main
-# -----------------------------
-def parse_args():
-    p = argparse.ArgumentParser(description="Train and evaluate M3 BNN for LCF life prediction")
+    # Inference configuration note
+    print(f"MC forward passes for inference: {int(mc_infer)}")
 
-    # I/O
-    p.add_argument("--csv", type=str, required=True,
-                   help="Path to the features CSV produced by M2")
-    p.add_argument("--outdir", type=str, default="outputs",
-                   help="Directory for outputs plots and models")
-
-    # Columns
-    p.add_argument("--col_strain_amp", type=str, default="Strain Amplitude (%)")
-    p.add_argument("--col_material", type=str, default="Material")
-    p.add_argument("--col_heat_treat", type=str, default="Heat Treatment")
-    p.add_argument("--col_target", type=str, default="Relative Cycle")
-
-    # Feature sets
-    p.add_argument("--use_enhanced", action="store_true",
-                   help="Use enhanced feature set that includes microstructural parameters")
-    p.add_argument("--mc_samples", type=int, default=100,
-                   help="Monte Carlo forward passes for uncertainty")
-
-    # Split
-    p.add_argument("--target_strain", type=float, default=1.2,
-                   help="Strain amplitude reserved for testing for example 1.2")
-    p.add_argument("--test_query", type=str, default="",
-                   help="Optional pandas query string for further test filtering for example \"Material == 1 and `Heat Treatment` == 400\"")
-
-    # Training
-    p.add_argument("--epochs", type=int, default=20000)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--kl_weight", type=float, default=1e-2)
-    p.add_argument("--seed", type=int, default=42)
-
-    # Plots
-    p.add_argument("--no_plots", action="store_true",
-                   help="Disable plotting")
-
-    return p.parse_args()
-
-
-def main():
-    args = parse_args()
-    set_seed(args.seed)
-
-    # Load
-    df = pd.read_csv(args.csv)
-
-    # Required columns and feature sets
-    common_cols = [args.col_strain_amp, args.col_material, args.col_heat_treat]
-    baseline_cols = ["Wp (kJ/m3)", "We (kJ/m3)", "Tensile Peak Stress (MPa)", "Compressive Peak Stress (MPa)"]
-    enhanced_cols = ["Inflection Strain (%)", "TYS Stress (MPa)", "Twinning Gradient (GPa)"]
-
-    baseline_input_cols = common_cols + baseline_cols
-    enhanced_input_cols = baseline_input_cols + enhanced_cols
-    input_cols = enhanced_input_cols if args.use_enhanced else baseline_input_cols
-
-    ensure_columns(df, input_cols + [args.col_target])
-
-    # Split by target strain amplitude
-    train_df = df[df[args.col_strain_amp] != args.target_strain].copy()
-    test_df = df[df[args.col_strain_amp] == args.target_strain].copy()
-
-    # Optional further restriction on the test set
-    if args.test_query:
-        try:
-            test_df = test_df.query(args.test_query)
-        except Exception as e:
-            raise ValueError(f"Failed to apply test_query. Error {e}")
-
-    if len(test_df) == 0:
-        raise ValueError("Empty test set after filtering. Adjust --target_strain or --test_query")
-
-    # Data arrays
-    X_train = train_df[input_cols].values
-    X_test = test_df[input_cols].values
-    y_train = train_df[[args.col_target]].values
-    y_test = test_df[[args.col_target]].values
-
-    # Scaling on train only
-    scaler = MinMaxScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-
-    # Train
-    model = TorchBNN(input_dim=X_train_scaled.shape[1])
-    model = train_bnn(model,
-                      X_train_scaled,
-                      y_train,
-                      n_epochs=args.epochs,
-                      lr=args.lr,
-                      kl_weight=args.kl_weight,
-                      log_every=1000)
-
-    # Predict with MC sampling
-    y_mean, y_std = predict_bnn(model, X_test_scaled, n_samples=args.mc_samples)
-
-    # Scores
-    pp = pp_score(y_test, y_mean, y_std)
-    total_pp = float(pp.sum())
-
-    # Output folder
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    outdir = os.path.join(args.outdir, f"m3_{'enh' if args.use_enhanced else 'base'}_{stamp}")
-    os.makedirs(outdir, exist_ok=True)
-
-    # Save model weights locally for the user
-    torch.save(model.state_dict(), os.path.join(outdir, "model.pt"))
-
-    # Save predictions
-    pred_df = test_df.copy()
-    pred_df["y_true"] = y_test.flatten()
-    pred_df["y_pred_mean"] = y_mean.flatten()
-    pred_df["y_pred_std"] = y_std.flatten()
-    pred_df["pp_score"] = pp.flatten()
-    pred_path = os.path.join(outdir, "predictions.csv")
-    pred_df.to_csv(pred_path, index=False)
-
-    print("\n--- Evaluation ---")
-    print(f"Test count {len(test_df)}")
-    print(f"Total PP score {total_pp:.6f}")
-    print(f"Saved predictions to {pred_path}")
-    print(f"Model saved to {os.path.join(outdir, 'model.pt')}")
-
-    # Plots
-    if not args.no_plots:
-        eps = 1e-6
-        y_true = y_test.flatten() + eps
-        y_mu = y_mean.flatten() + eps
-        y_sigma = y_std.flatten()
-
-        # Parity plot
-        plt.figure(figsize=(7, 6))
-        plt.errorbar(y_true, y_mu, yerr=y_sigma, fmt="o", capsize=3, alpha=0.8)
-        mn = min(y_true.min(), y_mu.min())
-        mx = max(y_true.max(), y_mu.max())
-        plt.plot([mn, mx], [mn, mx], "k--", linewidth=1)
-        plt.xscale("log")
-        plt.yscale("log")
-        plt.xlabel("True Relative Cycle N/Nf")
-        plt.ylabel("Predicted mean ± std")
-        plt.title(f"BNN parity plot  {'enhanced' if args.use_enhanced else 'baseline'}")
-        plt.grid(True, which="both", ls="--", linewidth=0.5)
-        plt.tight_layout()
-        plt.savefig(os.path.join(outdir, "parity_plot.png"), dpi=200)
-
-        # Instance-wise PP
-        plt.figure(figsize=(8, 4))
-        plt.plot(pp.flatten(), "o-")
-        plt.axhline(0, color="gray", linestyle="--", linewidth=0.8)
-        plt.xlabel("Test sample index")
-        plt.ylabel("PP score")
-        plt.title("Posterior probability per sample")
-        plt.grid(True, ls="--", linewidth=0.5)
-        plt.tight_layout()
-        plt.savefig(os.path.join(outdir, "pp_scores.png"), dpi=200)
-
-        plt.close("all")
+    return {
+        "model": model,
+        "scaler": scaler,
+        "train_loss_raw": train_losses,
+        "val_loss_raw": val_losses,
+        "train_loss_ema": train_losses_ema,
+        "val_loss_ema": val_losses_ema,
+        "train_loss_ma": train_losses_ma,
+        "val_loss_ma": val_losses_ma,
+        "epochs_ran": epochs_ran_bnn,
+        "best_val_loss": best_val_loss,
+        "best_epoch": best_epoch,
+        "save_dir": save_dir,
+    }
 
 
 if __name__ == "__main__":
-    main()
+    torch.manual_seed(42)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(42)
+
+    out_m3 = train_bnn(
+        n_epochs=50000,
+        kl_weight=0.01,
+        lr=1e-3,
+        patience=3000,
+        min_delta=0.0,
+        log_every=500,
+        n_mc_val=200,
+        mc_infer=100,
+    )
+
+    train_loss_m3 = out_m3["train_loss_raw"]
+    val_loss_m3 = out_m3["val_loss_raw"]
+    train_ema_m3 = out_m3["train_loss_ema"]
+    val_ema_m3 = out_m3["val_loss_ema"]
