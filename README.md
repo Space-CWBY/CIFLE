@@ -44,5 +44,4 @@ python analysis/CIFLE.py \
 Python 3.12 or newer is recommended.
 
 ## Citation
-If you use this code or model in your research, please cite our work  
-(citation details to be added upon publication).
+If you use this code or model in your research, please cite our work.
